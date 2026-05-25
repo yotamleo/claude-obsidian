@@ -1,4 +1,6 @@
 
+> **Yotam's fork** — sourced via the [himmel](https://github.com/yotamleo/himmel) marketplace; the original is at [AgriciDaniel/claude-obsidian](https://github.com/AgriciDaniel/claude-obsidian). Vendor + attribution only, no upstream PR for now. See [ATTRIBUTION.md](ATTRIBUTION.md) for full credits.
+
 # claude-obsidian
 
 <p align="center">

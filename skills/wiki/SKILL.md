@@ -12,6 +12,8 @@ allowed-tools: Read Write Edit Glob Grep Bash
 
 # wiki: Claude + Obsidian Knowledge Companion
 
+> **Vault resolution**: The vault and plugin are separate directories. Before using any paths, read `references/vault-resolution.md` to resolve `VAULT_ROOT` (where `wiki/`, `.raw/`, `.vault-meta/` live) and `$CLAUDE_PLUGIN_ROOT` (where `scripts/` lives). All paths below are relative to the resolved vault root unless noted as plugin paths.
+
 You are a knowledge architect. You build and maintain a persistent, compounding wiki inside an Obsidian vault. You don't just answer questions. You write, cross-reference, file, and maintain a structured knowledge base that gets richer with every source added and every question asked.
 
 The wiki is the product. Chat is just the interface.
@@ -251,3 +253,42 @@ When working on this skill, apply the 10-principle loop. See [`skills/think/SKIL
 | 8 | ACCEPT | The scaffold is opinionated; don't pretend it's neutral. Document the opinions in the scaffold output. |
 | 9 | CREATE | Scaffold the folders, write `hot.md` + `index.md` + `log.md` with starting structure. |
 | 10 | GROW | Vault structure should evolve — what works at month 1 may not at month 12. Build for that evolution. |
+
+---
+
+
+## Vault root vs content path — critical for Dataview
+
+Dataview `FROM "<path>"` is resolved relative to **vault root** (where `.obsidian/` lives), not relative to the open note or to the `wiki/` content folder.
+
+If the vault is structured as:
+
+```
+<vault-root>/         # .obsidian/ lives here
+├── .obsidian/
+├── .raw/
+└── wiki/             # content folder (NOT vault root)
+    ├── papers/
+    ├── Projects/
+    └── meta/
+```
+
+Then Dataview queries inside any note must address subfolders relative to `<vault-root>`:
+
+- ❌ Wrong: `FROM "papers"` → resolves to `<vault-root>/papers/` (does not exist → 0 results)
+- ✅ Right: `FROM "wiki/papers"` → resolves to `<vault-root>/wiki/papers/`
+
+Same applies to all subfolders: `wiki/Projects`, `wiki/meta`, `wiki/thesis`, etc.
+
+**Verify before writing any Dataview query in this vault:**
+
+```bash
+ls "<vault-parent>/.obsidian"   # if exists, that path IS vault root
+```
+
+If `.obsidian/` is at the same level as `wiki/`, then `wiki/` is NOT vault root, and all Dataview paths must be prefixed with `wiki/`.
+
+**Symptom of getting this wrong:** Dataview blocks render with "No results to show for table/list query" even though the folder contains hundreds of files.
+
+This rule applies when creating synthesis matrices, dashboards, lint reports, query notes, or any artefact that embeds Dataview queries.
+

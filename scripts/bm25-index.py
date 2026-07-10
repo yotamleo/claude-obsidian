@@ -46,7 +46,6 @@ Exit codes:
 """
 
 import argparse
-import fcntl
 import json
 import math
 import os
@@ -55,6 +54,13 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl  # POSIX only
+    _HAVE_FCNTL = True
+except ImportError:  # Windows (Git Bash Python) ships no fcntl module
+    fcntl = None
+    _HAVE_FCNTL = False
 
 VAULT_ROOT = Path(__file__).resolve().parent.parent
 META_DIR = VAULT_ROOT / ".vault-meta"
@@ -98,21 +104,72 @@ def tokenize(text):
 
 def acquire_lock():
     META_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_WRONLY, 0o644)
+    if _HAVE_FCNTL:
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            log("ERR: could not acquire bm25 lock")
+            sys.exit(EXIT_LOCK)
+        return fd
+    # Windows fallback (no fcntl): atomic O_EXCL lockfile == non-blocking exclusive.
+    # A lockfile older than 60s is treated as stale (crashed holder) and reaped,
+    # mirroring the age-based staleness used by wiki-lock.sh.
+    # The holder PID is written into the lockfile so release_lock() only removes
+    # a lock it still owns: if a slow (>60s) holder was reaped and another
+    # process re-acquired, the original holder must NOT delete the new holder's
+    # lockfile (that would open the door to a third concurrent writer).
+    # Known limitation vs flock: a live-but-slow holder can still be reaped
+    # once after 60s; the reap is logged so index corruption is diagnosable.
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        return fd
+    except FileExistsError:
+        try:
+            age = datetime.now(timezone.utc).timestamp() - os.path.getmtime(LOCK_PATH)
+            if age > 60:
+                # Steal via atomic rename: when several waiters race to reap
+                # the same stale lock, exactly ONE os.replace() succeeds; the
+                # losers raise and exit below instead of unlinking the
+                # winner's freshly-created lockfile (dual-acquisition race).
+                reaped = str(LOCK_PATH) + (".reaped.%d" % os.getpid())
+                os.replace(str(LOCK_PATH), reaped)
+                log(f"WARN: reaping stale bm25 lock (age {age:.0f}s > 60s)")
+                os.unlink(reaped)
+                fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                os.write(fd, str(os.getpid()).encode("ascii"))
+                return fd
+        except OSError:
+            pass
         log("ERR: could not acquire bm25 lock")
         sys.exit(EXIT_LOCK)
-    return fd
 
 
 def release_lock(fd):
+    if _HAVE_FCNTL:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        return
+    # Windows fallback: close, then remove the lockfile ONLY if we still own it
+    # (it contains our PID). If it holds another PID, we were stale-reaped while
+    # running and another writer owns the lock now - leave it alone and log.
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
         os.close(fd)
+    finally:
+        try:
+            with open(LOCK_PATH, "r", encoding="ascii", errors="replace") as f:
+                owner = f.read().strip()
+            if owner == str(os.getpid()):
+                os.unlink(LOCK_PATH)
+            else:
+                log(f"WARN: bm25 lock now owned by pid {owner or '?'} "
+                    "(we were stale-reaped mid-run); not removing")
+        except OSError:
+            pass
 
 
 def discover_chunks():

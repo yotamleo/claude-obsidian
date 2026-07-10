@@ -127,6 +127,10 @@ validate_path() {
   # GNU coreutils + macOS BSD where realpath flag semantics differ).
   if command -v python3 >/dev/null 2>&1; then
     local resolved root
+    # (upstream #115) the resolved= fallback below keeps set -e from aborting
+    # when python3 exists on PATH but cannot run - e.g. the Windows Store alias
+    # stub, which passes command -v yet exits 49 (Python was not found).
+    # Fail-open matches the existing intent: no python3 means skip symlink check.
     resolved=$(VAULT_ROOT_BASH="$VAULT_ROOT" P_BASH="$p" python3 -c '
 import os, sys
 root = os.path.realpath(os.environ["VAULT_ROOT_BASH"])
@@ -134,7 +138,10 @@ candidate = os.environ["P_BASH"]
 target = os.path.realpath(os.path.join(root, candidate))
 common = os.path.commonpath([root, target]) if target else ""
 sys.stdout.write("INSIDE" if common == root else "OUTSIDE")
-' 2>/dev/null)
+' 2>/dev/null) || resolved=""
+    # Signal the degraded mode: without a working python3 the symlink-escape
+    # check is skipped entirely (fail-open by design, but it should be visible).
+    [ -z "$resolved" ] && echo "wiki-lock: python3 present but unusable; symlink-escape check skipped for: $p" >&2
     [ "$resolved" = "OUTSIDE" ] && die "path resolves outside vault via symlink: $p" 4
   fi
   return 0
@@ -149,13 +156,62 @@ is_alive() {
 
 # Atomic meta-lock wrapper. Funcs that mutate LOCK_DIR call under this lock so
 # acquire/release/clear-stale don't race against each other.
+#
+# Portability note (vault-local patch): flock(1) is absent on Windows Git Bash
+# (msys2 ships no util-linux flock). When flock is unavailable we fall back to
+# an atomic mkdir spinlock — mkdir is atomic on every POSIX/NTFS filesystem, so
+# it serializes meta-lock holders exactly like flock -x, just with a poll loop.
+# 5s timeout mirrors `flock -w 5`; a lock dir older than 5s is treated as stale
+# (crashed holder) and reaped. When flock IS present (Linux/macOS) the original
+# path runs unchanged.
 with_meta_lock() {
   ensure_dirs
-  # Use flock under bash's redirect; meta lock is short-lived per command.
-  (
-    flock -x -w 5 9 || die "could not acquire meta-lock within 5s" 1
-    "$@"
-  ) 9>"$META_LOCK"
+  if command -v flock >/dev/null 2>&1; then
+    # Use flock under bash's redirect; meta lock is short-lived per command.
+    (
+      flock -x -w 5 9 || die "could not acquire meta-lock within 5s" 1
+      "$@"
+    ) 9>"$META_LOCK"
+  else
+    # flock-less fallback: atomic mkdir spinlock (Windows Git Bash).
+    local mdir="${META_LOCK}.d" waited=0 holder_pid=""
+    until mkdir "$mdir" 2>/dev/null; do
+      # Reap only a DEAD holder (pid recorded but no longer alive), or an
+      # ownerless dir older than 5s (holder crashed between mkdir and the pid
+      # write). A live holder is never reaped - like flock -w 5 we wait, then
+      # die, instead of stealing the lock out from under a slow holder.
+      holder_pid=$(cat "$mdir/pid" 2>/dev/null || true)
+      if [ -d "$mdir" ] && [ -n "$holder_pid" ] && ! is_alive "$holder_pid"; then
+        # Steal via atomic rename: of several waiters racing to reap the same
+        # dead holder, exactly one mv succeeds; losers just re-loop. This
+        # prevents a loser from rm-ing the winner's freshly re-created lock.
+        if mv "$mdir" "$mdir.reap.$$" 2>/dev/null; then
+          echo "wiki-lock: reaping meta-lock of dead pid $holder_pid" >&2
+          rm -f "$mdir.reap.$$/pid" 2>/dev/null; rmdir "$mdir.reap.$$" 2>/dev/null || true
+        fi
+        continue
+      fi
+      if [ -d "$mdir" ] && [ -z "$holder_pid" ] && [ -z "$(find "$mdir" -maxdepth 0 -newermt '-5 seconds' 2>/dev/null)" ]; then
+        echo "wiki-lock: reaping ownerless stale meta-lock dir" >&2
+        rmdir "$mdir" 2>/dev/null || true
+        continue
+      fi
+      sleep 0.1
+      waited=$((waited + 1))
+      [ "$waited" -ge 50 ] && die "could not acquire meta-lock within 5s" 1
+    done
+    echo "$$" > "$mdir/pid" 2>/dev/null || true
+    local rc=0
+    "$@" || rc=$?
+    # Release only if we still own the dir (our pid recorded). If a reaper
+    # took it over, removing it would unlock someone else's critical section.
+    if [ "$(cat "$mdir/pid" 2>/dev/null || true)" = "$$" ]; then
+      rm -f "$mdir/pid" 2>/dev/null; rmdir "$mdir" 2>/dev/null || true
+    else
+      echo "wiki-lock: meta-lock no longer ours on release; leaving it" >&2
+    fi
+    return "$rc"
+  fi
 }
 
 read_lockfile() {

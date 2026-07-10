@@ -6,9 +6,12 @@ upstream stage) and reorders them using semantic similarity.
 
 v1.7 strategy (in preference order, automatically chosen at runtime):
   1. If ollama is reachable AND nomic-embed-text is pulled
-       → embed the query, embed each candidate's contextualized_text,
-         rank by cosine. Caches per-chunk embeddings in
-         .vault-meta/embed-cache.json keyed by body_hash.
+       → embed the query (with the "search_query:" task prefix) and each
+         candidate's contextualized_text (with the "search_document:" prefix),
+         rank by cosine. The nomic task prefixes are required for correct
+         asymmetric retrieval; omitting them degrades ranking quality.
+         Caches per-chunk embeddings in .vault-meta/embed-cache.json keyed by
+         body_hash + EMBED_SCHEME (so a convention change invalidates old vectors).
   2. Otherwise
        → no-op rerank: return candidates in input order with a synthesized
          note. Caller (retrieve.py) still gets a useful result; downstream
@@ -42,7 +45,12 @@ Exit codes:
 """
 
 import argparse
-import fcntl
+try:
+    import fcntl  # POSIX only
+    _HAVE_FCNTL = True
+except ImportError:  # Windows (Git Bash Python) ships no fcntl module
+    fcntl = None
+    _HAVE_FCNTL = False
 import json
 import math
 import os
@@ -65,6 +73,39 @@ DEFAULT_MODEL = "nomic-embed-text"
 OLLAMA_TIMEOUT_SEC = 3
 EMBED_TIMEOUT_SEC = 30
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+# Nomic task prefixes. nomic-embed-text is trained with asymmetric task
+# instruction prefixes ("search_query:" for the query, "search_document:" for
+# the indexed text). Omitting them places query and document in a sub-optimal
+# region of the embedding space and measurably degrades retrieval quality — see
+# https://huggingface.co/nomic-ai/nomic-embed-text-v1.5#task-instruction-prefixes
+# We only apply them for nomic-* models; other embedding models (mxbai, bge, …)
+# either use different prefixes or none, so for those with_task_prefix() is a
+# no-op and the raw text is embedded as before.
+QUERY_TASK_PREFIX = "search_query: "
+DOC_TASK_PREFIX = "search_document: "
+
+# Bump when the embedding *input* convention changes (e.g. adding the task
+# prefixes above). It is part of the embed-cache key, so changing it transparently
+# invalidates vectors produced under the old convention instead of silently mixing
+# prefixed and prefix-less embeddings in the same cosine space.
+EMBED_SCHEME = "nomic-prefix-v1"
+
+
+def with_task_prefix(text, role, model=None):
+    """Prepend the nomic task-instruction prefix for `role` ('query'|'document').
+
+    No-op (returns text unchanged) for non-nomic models, so swapping DEFAULT_MODEL
+    to an embedder with a different convention stays correct.
+    """
+    model = model or DEFAULT_MODEL
+    if not model.lower().startswith("nomic"):
+        return text
+    if role == "query":
+        return QUERY_TASK_PREFIX + text
+    if role == "document":
+        return DOC_TASK_PREFIX + text
+    raise ValueError(f"role must be 'query' or 'document', got {role!r}")
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -150,14 +191,17 @@ def save_cache(cache):
     fd = os.open(str(CACHE_LOCK), os.O_CREAT | os.O_WRONLY, 0o644)
     locked = False
     try:
-        for attempt in range(3):
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
-                break
-            except BlockingIOError:
-                time.sleep(0.1)
-        if not locked:
+        if _HAVE_FCNTL:
+            for attempt in range(3):
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    time.sleep(0.1)
+        # On Windows (no fcntl) locked stays False and we fall through to the
+        # atomic temp+rename write below — expected, so suppress the WARN there.
+        if not locked and _HAVE_FCNTL:
             msg = ("WARN: rerank embed-cache lock unavailable after 3 tries; "
                    "writing unlocked (atomic via temp+rename). Concurrent writers "
                    "may overwrite each other's last update.")
@@ -193,6 +237,17 @@ def load_chunk(chunk_rel_path):
         return json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+def _fallback_score(c):
+    """BM25 passthrough for no-op/error rerank paths. Warn when a candidate is
+    missing BOTH score keys - that is an upstream schema regression, not a
+    genuinely zero-relevance result, and it would otherwise sort silently
+    to the bottom as 0.0."""
+    if "bm25_score" not in c and "score" not in c:
+        log("WARN: candidate %s has neither bm25_score nor score; defaulting to 0.0"
+            % c.get("chunk_id", "?"))
+    return float(c.get("bm25_score", c.get("score", 0.0)))
+
+
 
 
 def rerank(query, candidates, top_k=5, allow_remote=False):
@@ -204,24 +259,24 @@ def rerank(query, candidates, top_k=5, allow_remote=False):
     if not alive:
         log("ollama unreachable — no-op rerank")
         for c in candidates:
-            c["rerank_score"] = float(c.get("score", 0.0))
+            c["rerank_score"] = _fallback_score(c)
             c["rerank_source"] = "noop-no-ollama"
         return candidates[:top_k]
     if DEFAULT_MODEL not in models:
         log(f"model {DEFAULT_MODEL} not pulled — no-op rerank")
         for c in candidates:
-            c["rerank_score"] = float(c.get("score", 0.0))
+            c["rerank_score"] = _fallback_score(c)
             c["rerank_source"] = "noop-no-model"
         return candidates[:top_k]
 
     cache = load_cache()
     cache_dirty = False
     try:
-        q_emb = embed_one(url, DEFAULT_MODEL, query)
+        q_emb = embed_one(url, DEFAULT_MODEL, with_task_prefix(query, "query"))
     except Exception as e:
         log(f"query embed failed: {e}")
         for c in candidates:
-            c["rerank_score"] = float(c.get("score", 0.0))
+            c["rerank_score"] = _fallback_score(c)
             c["rerank_source"] = "noop-embed-error"
         return candidates[:top_k]
 
@@ -232,15 +287,15 @@ def rerank(query, candidates, top_k=5, allow_remote=False):
             c["rerank_source"] = "missing-chunk"
             continue
         body_hash = chunk.get("body_hash", "")
-        cache_key = f"{DEFAULT_MODEL}:{body_hash}"
+        cache_key = f"{DEFAULT_MODEL}:{EMBED_SCHEME}:{body_hash}"
         emb = cache.get(cache_key)
         if not emb:
             text = chunk.get("contextualized_text") or chunk.get("raw_text", "")
             try:
-                emb = embed_one(url, DEFAULT_MODEL, text)
+                emb = embed_one(url, DEFAULT_MODEL, with_task_prefix(text, "document"))
             except Exception as e:
                 log(f"embed failed for {c.get('chunk_id')}: {e}")
-                c["rerank_score"] = float(c.get("score", 0.0))
+                c["rerank_score"] = _fallback_score(c)
                 c["rerank_source"] = "embed-error"
                 continue
             cache[cache_key] = emb

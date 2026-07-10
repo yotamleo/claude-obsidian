@@ -130,8 +130,14 @@ def acquire_lock():
         try:
             age = datetime.now(timezone.utc).timestamp() - os.path.getmtime(LOCK_PATH)
             if age > 60:
+                # Steal via atomic rename: when several waiters race to reap
+                # the same stale lock, exactly ONE os.replace() succeeds; the
+                # losers raise and exit below instead of unlinking the
+                # winner's freshly-created lockfile (dual-acquisition race).
+                reaped = str(LOCK_PATH) + (".reaped.%d" % os.getpid())
+                os.replace(str(LOCK_PATH), reaped)
                 log(f"WARN: reaping stale bm25 lock (age {age:.0f}s > 60s)")
-                os.unlink(LOCK_PATH)
+                os.unlink(reaped)
                 fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
                 os.write(fd, str(os.getpid()).encode("ascii"))
                 return fd

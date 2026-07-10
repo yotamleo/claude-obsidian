@@ -182,8 +182,13 @@ with_meta_lock() {
       # die, instead of stealing the lock out from under a slow holder.
       holder_pid=$(cat "$mdir/pid" 2>/dev/null || true)
       if [ -d "$mdir" ] && [ -n "$holder_pid" ] && ! is_alive "$holder_pid"; then
-        echo "wiki-lock: reaping meta-lock of dead pid $holder_pid" >&2
-        rm -f "$mdir/pid" 2>/dev/null; rmdir "$mdir" 2>/dev/null || true
+        # Steal via atomic rename: of several waiters racing to reap the same
+        # dead holder, exactly one mv succeeds; losers just re-loop. This
+        # prevents a loser from rm-ing the winner's freshly re-created lock.
+        if mv "$mdir" "$mdir.reap.$$" 2>/dev/null; then
+          echo "wiki-lock: reaping meta-lock of dead pid $holder_pid" >&2
+          rm -f "$mdir.reap.$$/pid" 2>/dev/null; rmdir "$mdir.reap.$$" 2>/dev/null || true
+        fi
         continue
       fi
       if [ -d "$mdir" ] && [ -z "$holder_pid" ] && [ -z "$(find "$mdir" -maxdepth 0 -newermt '-5 seconds' 2>/dev/null)" ]; then

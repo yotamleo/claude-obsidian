@@ -127,6 +127,10 @@ validate_path() {
   # GNU coreutils + macOS BSD where realpath flag semantics differ).
   if command -v python3 >/dev/null 2>&1; then
     local resolved root
+    # (upstream #115) the resolved= fallback below keeps set -e from aborting
+    # when python3 exists on PATH but cannot run - e.g. the Windows Store alias
+    # stub, which passes command -v yet exits 49 (Python was not found).
+    # Fail-open matches the existing intent: no python3 means skip symlink check.
     resolved=$(VAULT_ROOT_BASH="$VAULT_ROOT" P_BASH="$p" python3 -c '
 import os, sys
 root = os.path.realpath(os.environ["VAULT_ROOT_BASH"])
@@ -134,7 +138,7 @@ candidate = os.environ["P_BASH"]
 target = os.path.realpath(os.path.join(root, candidate))
 common = os.path.commonpath([root, target]) if target else ""
 sys.stdout.write("INSIDE" if common == root else "OUTSIDE")
-' 2>/dev/null)
+' 2>/dev/null) || resolved=""
     [ "$resolved" = "OUTSIDE" ] && die "path resolves outside vault via symlink: $p" 4
   fi
   return 0

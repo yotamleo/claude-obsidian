@@ -116,14 +116,25 @@ def acquire_lock():
     # Windows fallback (no fcntl): atomic O_EXCL lockfile == non-blocking exclusive.
     # A lockfile older than 60s is treated as stale (crashed holder) and reaped,
     # mirroring the age-based staleness used by wiki-lock.sh.
+    # The holder PID is written into the lockfile so release_lock() only removes
+    # a lock it still owns: if a slow (>60s) holder was reaped and another
+    # process re-acquired, the original holder must NOT delete the new holder's
+    # lockfile (that would open the door to a third concurrent writer).
+    # Known limitation vs flock: a live-but-slow holder can still be reaped
+    # once after 60s; the reap is logged so index corruption is diagnosable.
     try:
-        return os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        return fd
     except FileExistsError:
         try:
             age = datetime.now(timezone.utc).timestamp() - os.path.getmtime(LOCK_PATH)
             if age > 60:
+                log(f"WARN: reaping stale bm25 lock (age {age:.0f}s > 60s)")
                 os.unlink(LOCK_PATH)
-                return os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                os.write(fd, str(os.getpid()).encode("ascii"))
+                return fd
         except OSError:
             pass
         log("ERR: could not acquire bm25 lock")
@@ -137,12 +148,20 @@ def release_lock(fd):
         finally:
             os.close(fd)
         return
-    # Windows fallback: close and remove the lockfile so the next writer can take it.
+    # Windows fallback: close, then remove the lockfile ONLY if we still own it
+    # (it contains our PID). If it holds another PID, we were stale-reaped while
+    # running and another writer owns the lock now - leave it alone and log.
     try:
         os.close(fd)
     finally:
         try:
-            os.unlink(LOCK_PATH)
+            with open(LOCK_PATH, "r", encoding="ascii", errors="replace") as f:
+                owner = f.read().strip()
+            if owner == str(os.getpid()):
+                os.unlink(LOCK_PATH)
+            else:
+                log(f"WARN: bm25 lock now owned by pid {owner or '?'} "
+                    "(we were stale-reaped mid-run); not removing")
         except OSError:
             pass
 

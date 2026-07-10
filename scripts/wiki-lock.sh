@@ -139,6 +139,9 @@ target = os.path.realpath(os.path.join(root, candidate))
 common = os.path.commonpath([root, target]) if target else ""
 sys.stdout.write("INSIDE" if common == root else "OUTSIDE")
 ' 2>/dev/null) || resolved=""
+    # Signal the degraded mode: without a working python3 the symlink-escape
+    # check is skipped entirely (fail-open by design, but it should be visible).
+    [ -z "$resolved" ] && echo "wiki-lock: python3 present but unusable; symlink-escape check skipped for: $p" >&2
     [ "$resolved" = "OUTSIDE" ] && die "path resolves outside vault via symlink: $p" 4
   fi
   return 0
@@ -171,20 +174,37 @@ with_meta_lock() {
     ) 9>"$META_LOCK"
   else
     # flock-less fallback: atomic mkdir spinlock (Windows Git Bash).
-    local mdir="${META_LOCK}.d" waited=0
+    local mdir="${META_LOCK}.d" waited=0 holder_pid=""
     until mkdir "$mdir" 2>/dev/null; do
-      # Reap a stale holder (dir mtime older than 5s ⇒ crashed mid-operation).
-      if [ -d "$mdir" ] && [ -z "$(find "$mdir" -maxdepth 0 -newermt '-5 seconds' 2>/dev/null)" ]; then
-        rm -rf "$mdir" 2>/dev/null || true
+      # Reap only a DEAD holder (pid recorded but no longer alive), or an
+      # ownerless dir older than 5s (holder crashed between mkdir and the pid
+      # write). A live holder is never reaped - like flock -w 5 we wait, then
+      # die, instead of stealing the lock out from under a slow holder.
+      holder_pid=$(cat "$mdir/pid" 2>/dev/null || true)
+      if [ -d "$mdir" ] && [ -n "$holder_pid" ] && ! is_alive "$holder_pid"; then
+        echo "wiki-lock: reaping meta-lock of dead pid $holder_pid" >&2
+        rm -f "$mdir/pid" 2>/dev/null; rmdir "$mdir" 2>/dev/null || true
+        continue
+      fi
+      if [ -d "$mdir" ] && [ -z "$holder_pid" ] && [ -z "$(find "$mdir" -maxdepth 0 -newermt '-5 seconds' 2>/dev/null)" ]; then
+        echo "wiki-lock: reaping ownerless stale meta-lock dir" >&2
+        rmdir "$mdir" 2>/dev/null || true
         continue
       fi
       sleep 0.1
       waited=$((waited + 1))
       [ "$waited" -ge 50 ] && die "could not acquire meta-lock within 5s" 1
     done
+    echo "$$" > "$mdir/pid" 2>/dev/null || true
     local rc=0
     "$@" || rc=$?
-    rmdir "$mdir" 2>/dev/null || rm -rf "$mdir" 2>/dev/null || true
+    # Release only if we still own the dir (our pid recorded). If a reaper
+    # took it over, removing it would unlock someone else's critical section.
+    if [ "$(cat "$mdir/pid" 2>/dev/null || true)" = "$$" ]; then
+      rm -f "$mdir/pid" 2>/dev/null; rmdir "$mdir" 2>/dev/null || true
+    else
+      echo "wiki-lock: meta-lock no longer ours on release; leaving it" >&2
+    fi
     return "$rc"
   fi
 }

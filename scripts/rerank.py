@@ -237,6 +237,17 @@ def load_chunk(chunk_rel_path):
         return json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+def _fallback_score(c):
+    """BM25 passthrough for no-op/error rerank paths. Warn when a candidate is
+    missing BOTH score keys - that is an upstream schema regression, not a
+    genuinely zero-relevance result, and it would otherwise sort silently
+    to the bottom as 0.0."""
+    if "bm25_score" not in c and "score" not in c:
+        log("WARN: candidate %s has neither bm25_score nor score; defaulting to 0.0"
+            % c.get("chunk_id", "?"))
+    return float(c.get("bm25_score", c.get("score", 0.0)))
+
+
 
 
 def rerank(query, candidates, top_k=5, allow_remote=False):
@@ -248,13 +259,13 @@ def rerank(query, candidates, top_k=5, allow_remote=False):
     if not alive:
         log("ollama unreachable — no-op rerank")
         for c in candidates:
-            c["rerank_score"] = float(c.get("bm25_score", c.get("score", 0.0)))
+            c["rerank_score"] = _fallback_score(c)
             c["rerank_source"] = "noop-no-ollama"
         return candidates[:top_k]
     if DEFAULT_MODEL not in models:
         log(f"model {DEFAULT_MODEL} not pulled — no-op rerank")
         for c in candidates:
-            c["rerank_score"] = float(c.get("bm25_score", c.get("score", 0.0)))
+            c["rerank_score"] = _fallback_score(c)
             c["rerank_source"] = "noop-no-model"
         return candidates[:top_k]
 
@@ -265,7 +276,7 @@ def rerank(query, candidates, top_k=5, allow_remote=False):
     except Exception as e:
         log(f"query embed failed: {e}")
         for c in candidates:
-            c["rerank_score"] = float(c.get("bm25_score", c.get("score", 0.0)))
+            c["rerank_score"] = _fallback_score(c)
             c["rerank_source"] = "noop-embed-error"
         return candidates[:top_k]
 
@@ -284,7 +295,7 @@ def rerank(query, candidates, top_k=5, allow_remote=False):
                 emb = embed_one(url, DEFAULT_MODEL, with_task_prefix(text, "document"))
             except Exception as e:
                 log(f"embed failed for {c.get('chunk_id')}: {e}")
-                c["rerank_score"] = float(c.get("bm25_score", c.get("score", 0.0)))
+                c["rerank_score"] = _fallback_score(c)
                 c["rerank_source"] = "embed-error"
                 continue
             cache[cache_key] = emb

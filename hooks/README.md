@@ -6,7 +6,7 @@ Plugin hooks for the claude-obsidian wiki vault. All hooks are defined in `hooks
 
 | Event | Type | Subcommand | Purpose |
 |---|---|---|---|
-| `SessionStart` | command | `session-start` | Loads `wiki/hot.md` into context via the dispatcher. A second command hook reaps stale wiki locks (`wiki-lock.sh clear-stale`). Matcher: startup / resume. (Fork note: prompt-type hooks are removed in this fork — unsupported by our Claude Code baseline.) |
+| `SessionStart` | command | `session-start` | Loads `wiki/hot.md` into context via the dispatcher. A second command hook reaps stale wiki locks (`wiki-lock.sh clear-stale`). Matcher: startup / resume. (Fork notes: prompt-type hooks are removed in this fork — unsupported by our Claude Code baseline. The clear-stale hook uses a cwd-relative path, so it only runs in clone-as-vault setups; elsewhere it silently no-ops.) |
 | `PostCompact` | command | `post-compact` | Re-loads `wiki/hot.md` after context compaction. Hook-injected context does not survive compaction (only `CLAUDE.md` does), so this hook restores the hot cache mid-session. |
 | `PostToolUse` | command | (fork shell hook) | Auto-commits wiki changes after `Write` or `Edit`. This fork keeps its lock-aware shell hook (defers auto-commit while wiki locks are held; `.vault-meta/auto-commit.disabled` kill-switch) instead of the dispatcher subcommand — `post-tool-use` exists in the dispatcher but is not registered. |
 | `Stop` | command | `stop` | If `git diff --name-only HEAD` shows any `wiki/` change, prints the `WIKI_CHANGED:` marker on stdout to ask Claude to refresh `wiki/hot.md`. |

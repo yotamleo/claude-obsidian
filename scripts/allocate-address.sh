@@ -32,10 +32,50 @@ mkdir -p "$(dirname "$COUNTER_FILE")" || {
 }
 
 # Acquire exclusive lock with 5-second timeout. Release automatically on scope exit.
-exec 9>"$LOCK_FILE"
-if ! flock -x -w 5 9; then
-  echo "ERR: could not acquire address allocator lock within 5s" >&2
-  exit 1
+#
+# Portability note: flock(1) is absent on Windows Git Bash (msys2 ships no
+# util-linux flock) and on some macOS installs. When flock is unavailable we
+# fall back to an atomic mkdir spinlock — mkdir is atomic on every POSIX/NTFS
+# filesystem, so it serializes allocator callers exactly like flock -x, just
+# with a poll loop. Pattern mirrors scripts/wiki-lock.sh's flock-less
+# with_meta_lock fallback (adopted there from upstream PR #114's shape).
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK_FILE"
+  if ! flock -x -w 5 9; then
+    echo "ERR: could not acquire address allocator lock within 5s" >&2
+    exit 1
+  fi
+else
+  LOCK_DIR="${LOCK_FILE}.d"
+  waited=0
+  until mkdir "$LOCK_DIR" 2>/dev/null; do
+    holder_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -d "$LOCK_DIR" ] && [ -n "$holder_pid" ] && ! kill -0 "$holder_pid" 2>/dev/null; then
+      # Holder is dead; steal via atomic rename (of several racing waiters,
+      # exactly one mv succeeds) so a loser can't rm the winner's fresh dir.
+      if mv "$LOCK_DIR" "$LOCK_DIR.reap.$$" 2>/dev/null; then
+        rm -f "$LOCK_DIR.reap.$$/pid" 2>/dev/null
+        rmdir "$LOCK_DIR.reap.$$" 2>/dev/null || true
+      fi
+      continue
+    fi
+    if [ -d "$LOCK_DIR" ] && [ -z "$holder_pid" ] \
+        && [ -z "$(find "$LOCK_DIR" -maxdepth 0 -newermt '-5 seconds' 2>/dev/null)" ]; then
+      # Ownerless dir older than 5s: holder crashed between mkdir and pid write.
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      continue
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+    if [ "$waited" -ge 50 ]; then
+      echo "ERR: could not acquire address allocator lock within 5s" >&2
+      exit 1
+    fi
+  done
+  echo "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
+  # Release only if we still own the dir (our pid recorded) — if a reaper
+  # took it over, removing it would unlock someone else's critical section.
+  trap '[ "$(cat "$LOCK_DIR/pid" 2>/dev/null || true)" = "$$" ] && { rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null || true; }' EXIT
 fi
 
 scan_max_c_address() {

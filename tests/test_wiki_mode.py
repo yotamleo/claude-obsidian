@@ -17,6 +17,10 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
+# Windows consoles default stdout to cp1252, which can't encode the '→'
+# glyphs in test labels below; force utf-8 so output doesn't crash mid-run.
+sys.stdout.reconfigure(encoding="utf-8")
+
 ROOT = Path(__file__).resolve().parent.parent
 HELPER = ROOT / "scripts" / "wiki-mode.py"
 

@@ -1,3 +1,5 @@
+> **Himmel fork** — maintained at [yotamleo/claude-obsidian](https://github.com/yotamleo/claude-obsidian) for the [himmel](https://github.com/yotamleo/himmel) marketplace; upstream is [AgriciDaniel/claude-obsidian](https://github.com/AgriciDaniel/claude-obsidian).
+
 <p align="center">
   <img src="assets/cover.png" alt="claude-obsidian cover featuring an astronaut, the Obsidian crystal, and a connected knowledge graph" width="100%">
 </p>
